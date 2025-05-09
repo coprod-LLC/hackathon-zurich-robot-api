@@ -4,8 +4,8 @@ import cv2
 # import cv2.typing # Ensure this is uncommented
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import CompressedImage
-from geometry_msgs.msg import TwistStamped, Twist # Import TwistStamped and Twist
+from sensor_msgs.msg import CompressedImage, Imu # Import Imu message
+from geometry_msgs.msg import TwistStamped, Twist, Quaternion # Import Quaternion for type hint
 from cv_bridge import CvBridge, CvBridgeError
 import threading
 import time
@@ -44,6 +44,11 @@ class Omnibot:
         self.shutdown_event = threading.Event()
         self.movement_revert_timer: threading.Timer | None = None
 
+        self.current_orientation_quat: Quaternion | None = None
+        self.orientation_lock = threading.Lock()
+        self.initial_yaw_deg: float | None = None # To store the initial yaw offset
+        self.initial_orientation_lock = threading.Lock() # Lock for setting initial_yaw_deg
+
         self.subscription = self.node.create_subscription(
             CompressedImage,
             '/camera/image_raw/compressed', # Standard topic for compressed images
@@ -55,6 +60,12 @@ class Omnibot:
             '/thermal_image/compressed',
             self._thermal_image_callback,
             10) # QoS profile depth
+
+        self.imu_subscription = self.node.create_subscription(
+            Imu,
+            '/imu/data',
+            self._imu_callback,
+            10) # QoS profile for IMU data
 
         self.cmd_vel_publisher_thread = threading.Thread(target=self._publish_cmd_vel_loop, daemon=True)
         self.executor_thread = threading.Thread(target=self._spin_node, daemon=True)
@@ -105,6 +116,22 @@ class Omnibot:
             self.node.get_logger().error(f'CV Bridge Error (Thermal): {e}')
         except Exception as e:
             self.node.get_logger().error(f'Error processing thermal image: {e}')
+
+    def _imu_callback(self, msg: Imu):
+        """Callback for the IMU data. Stores the orientation quaternion and sets initial yaw offset."""
+        with self.orientation_lock:
+            self.current_orientation_quat = msg.orientation
+        
+        # Set initial orientation offset on first message
+        with self.initial_orientation_lock:
+            if self.initial_yaw_deg is None:
+                # Calculate yaw from this first message
+                q = msg.orientation
+                t0 = +2.0 * (q.w * q.z + q.x * q.y)
+                t1 = +1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+                initial_yaw_rad = math.atan2(t0, t1)
+                self.initial_yaw_deg = math.degrees(initial_yaw_rad)
+                self.node.get_logger().info(f"Initial orientation captured. Yaw offset set to: {self.initial_yaw_deg:.2f} degrees.")
 
     def _publish_cmd_vel_loop(self):
         """Continuously publishes the current_command_twist at a fixed rate."""
@@ -159,7 +186,46 @@ class Omnibot:
                 return self.current_thermal_frame.copy() # Return a copy
             return None
 
-    def advance(self, axis: Point2d, distance: float, rotation_angle_deg: float = 0.0, *, wait_for_completion: bool = False) -> bool:
+    def get_orientation(self) -> float | None:
+        """
+        Computes the robot's current orientation (yaw) in degrees from IMU data.
+        Returns None if no IMU data has been received yet.
+        """
+        q: Quaternion | None = None
+        with self.orientation_lock:
+            if self.current_orientation_quat is not None:
+                # Create a copy to work with, to release lock faster
+                q = Quaternion(
+                    x=self.current_orientation_quat.x,
+                    y=self.current_orientation_quat.y,
+                    z=self.current_orientation_quat.z,
+                    w=self.current_orientation_quat.w
+                )
+        
+        if q is None:
+            # self.node.get_logger().debug("No orientation data available yet.")
+            return None
+
+        # Calculate current absolute yaw
+        t0 = +2.0 * (q.w * q.z + q.x * q.y)
+        t1 = +1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        current_absolute_yaw_rad = math.atan2(t0, t1)
+        current_absolute_yaw_deg = math.degrees(current_absolute_yaw_rad)
+
+        # Apply offset if initial orientation has been set
+        with self.initial_orientation_lock: # Protect read of initial_yaw_deg in case it's being set
+            if self.initial_yaw_deg is not None:
+                relative_yaw_deg = current_absolute_yaw_deg - self.initial_yaw_deg
+                # Normalize to [-180, 180)
+                relative_yaw_deg = (relative_yaw_deg + 180.0) % 360.0 - 180.0
+                return relative_yaw_deg
+            else:
+                # Initial orientation not yet captured, return None or absolute based on desired behavior
+                # Returning None until zeroed is consistent with the idea of "get_orientation" after zeroing
+                self.node.get_logger().debug("Initial orientation not yet captured. Cannot provide relative orientation.")
+                return None 
+
+    def move(self, axis: Point2d, distance: float, rotation_angle_deg: float = 0.0, *, wait_for_completion: bool = False) -> bool:
         base_desired_linear_speed = 0.1  # m/s
         base_desired_angular_speed_dps = 30.0 # degrees/s
         speed_correction_factor = 1.1
@@ -260,6 +326,12 @@ class Omnibot:
         
         return True
 
+    def advance(self, axis: Point2d, distance: float, *, wait_for_completion: bool = False) -> bool:
+        return self.move(axis=axis, distance=distance, wait_for_completion=wait_for_completion)
+
+    def rotate(self, rotation_angle_deg: float, *, wait_for_completion: bool = False) -> bool:
+        return self.move(axis=Point2d(x=0, y=0), distance=0, rotation_angle_deg=rotation_angle_deg, wait_for_completion=wait_for_completion)
+
     def shutdown(self):
         """
         Shuts down the ROS2 node and cleans up resources.
@@ -325,86 +397,59 @@ if __name__ == '__main__':
     display_thermal = False
 
     try:
-        # print("Waiting for thermal frame...")
-        # # Loop until thermal frame is received or timeout
-        # while thermal_frame is None and waited_time < max_wait_time_seconds:
-        #     thermal_frame = omnibot_instance.get_frame_thermal()
-        #     if thermal_frame is not None:
-        #         print(f"Thermal Frame received: Shape {thermal_frame.shape}")
-        #         cv2.imshow("Omnibot Thermal Frame", thermal_frame)
-        #         display_thermal = True
-        #         print("Displaying thermal frame. Press 'q' in the OpenCV window or Ctrl+C in terminal to continue/close.")
-                
-        #         key_pressed_in_window = False
-        #         while True: 
-        #             key = cv2.waitKey(100) 
-        #             if key != -1:
-        #                 print("Key pressed in OpenCV window.")
-        #                 if key == ord('q'): # Quit if 'q' is pressed
-        #                     key_pressed_in_window = True
-        #                     break
-                    
-        #             if display_thermal and cv2.getWindowProperty("Omnibot Thermal Frame", cv2.WND_PROP_VISIBLE) < 1:
-        #                 print("Thermal OpenCV window was closed.")
-        #                 key_pressed_in_window = True 
-        #                 break
-        #             if key_pressed_in_window: break # Exit if q pressed or window closed
-        #         break 
-            
-        #     if not display_thermal: 
-        #         time.sleep(check_interval_seconds)
-        #         waited_time += check_interval_seconds
-        
-        # if thermal_frame is None:
-        #     print(f"No Thermal frame received within {max_wait_time_seconds} seconds.")
-
-        # Example of using the advance method
-        print("\n--- Testing advance method ---")
-        # Ensure node is active before trying to use advance
-        # A short sleep might be needed for the node and publisher to fully initialize after Omnibot()
-        # time.sleep(0.5) 
         if omnibot_instance.node.executor._is_shutdown:
             print("ROS Node is shutdown, cannot test advance.")
         else:
-            # print("\n1. Advancing forward (axis x=1, y=0) by 0.5m, non-blocking...")
-            # success = omnibot_instance.advance(Point2d(x=1, y=0), distance=0.5, wait_for_completion=False)
-            # print(f"Advance non-blocking linear initiated: {success}")
-            # if success:
-            #     print("Waiting for 2 seconds to observe non-blocking movement (total duration should be ~5s)...")
-            #     time.sleep(2) # Partial wait
+            # print("Testing advance method...")
+            # omnibot_instance.(axis=Point2d(x=1, y=0), distance=0.5, wait_for_completion=True)
+            # print("Advance method tested successfully.")
+            print("Testing rotate method...")
+            omnibot_instance.rotate(rotation_angle_deg=45.0, wait_for_completion=True)
+            print("Rotate method tested successfully.")
 
-            # print("\n2. Pure rotation: 90 degrees, blocking...")
-            # success = omnibot_instance.advance(Point2d(x=0, y=0), distance=0, rotation_angle_deg=90.0, wait_for_completion=True)
-            # print(f"Advance blocking pure rotation (90deg) completed: {success}")
-            # time.sleep(1) # Pause
+        # Test IMU Orientation - should now be relative after first few readings
+        print("\n--- Testing get_orientation (zeroed at startup) ---")
+        print("Waiting a moment for initial IMU data to establish zero orientation...")
+        time.sleep(1.0) # Give a little time for the first IMU message to arrive
 
-            # print("\n3. Combined: Forward 0.3m and Rotate -45 degrees, blocking...")
-            # success = omnibot_instance.advance(Point2d(x=1, y=0), distance=0.3, rotation_angle_deg=-45.0, wait_for_completion=True)
-            # print(f"Advance blocking combined (0.3m, -45deg) completed: {success}")
-            # time.sleep(1) # Pause
+        for i in range(15): # Check for orientation 15 times over 3 seconds
+            orientation = omnibot_instance.get_orientation()
+            if orientation is not None:
+                print(f"Current zeroed orientation (yaw): {orientation:.2f} degrees")
+            else:
+                print("Waiting for IMU data / initial orientation to be set...")
+            time.sleep(0.2)
+        
+        # Existing __main__ tests for movement, adjusted to use move/rotate methods
+        # print("\n--- Testing movement methods ---")
+        # if hasattr(omnibot_instance.node.executor, '_is_shutdown') and omnibot_instance.node.executor._is_shutdown:
+        #     print("ROS Node is shutdown, cannot test movement.")
+        # elif omnibot_instance.node.executor is None:
+        #     print("ROS Node executor not available, cannot test movement.")
+        # else:
+        #     print("\n1. Moving forward by 0.3m, blocking...")
+        #     success = omnibot_instance.move(Point2d(x=1, y=0), distance=0.3, wait_for_completion=True)
+        #     print(f"Move forward completed: {success}")
+        #     time.sleep(1)
 
-            # print("\n4. Explicit stop command (distance 0, rotation 0)...")
-            # success = omnibot_instance.advance(Point2d(x=0,y=0), distance=0, rotation_angle_deg=0, wait_for_completion=True)
-            # print(f"Advance explicit stop: {success}")
-            # time.sleep(1)
+        #     print("\n2. Rotating +90 degrees, blocking...")
+        #     success = omnibot_instance.rotate(rotation_angle_deg=90.0, wait_for_completion=True)
+        #     print(f"Rotate +90deg completed: {success}")
+        #     time.sleep(1)
 
-            print("\n5. Advancing backward (axis x=-1, y=0) by 0.2m, blocking...")
-            success = omnibot_instance.advance(Point2d(x=0, y=-1), distance=0.84, wait_for_completion=True)
-            print(f"Advance blocking backward (0.2m) completed: {success}")
+        #     print("\n3. Moving forward 0.2m and Rotating -45 degrees, blocking...")
+        #     success = omnibot_instance.move(Point2d(x=1, y=0), distance=0.2, rotation_angle_deg=-45.0, wait_for_completion=True)
+        #     print(f"Move combined completed: {success}")
+        #     time.sleep(1)
 
-            # # Original tests (can be re-enabled if needed)
-            # print("\nAdvancing diagonally (axis x=1, y=1) by 0.1m, blocking...")
-            # success = omnibot_instance.advance(Point2d(x=1, y=1), distance=0.1, wait_for_completion=True)
-            # print(f"Advance blocking completed: {success}")
-            # print("Movement should be finished.")
+        #     print("\n4. Explicit stop command...")
+        #     success = omnibot_instance.move(Point2d(x=0,y=0), distance=0, rotation_angle_deg=0, wait_for_completion=True)
+        #     print(f"Explicit stop: {success}")
+        #     time.sleep(1)
 
-            # print("\nAttempting to advance 0 distance...")
-            # success = omnibot_instance.advance(Point2d(x=1, y=0), distance=0.0)
-            # print(f"Advance with 0 distance: {success}")
-
-            # print("\nAttempting to advance with 0 magnitude axis and non-zero distance...")
-            # success = omnibot_instance.advance(Point2d(x=0, y=0), distance=0.1)
-            # print(f"Advance with 0-axis, non-zero distance: {success}")
+            # # The thermal image display part is commented out as per previous state of __main__ in user's file
+            # print("\n--- Testing thermal image retrieval (original example) ---")
+            # ... (thermal image code was here)
 
     except KeyboardInterrupt:
         print("Interrupted by user.")
